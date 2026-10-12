@@ -6,6 +6,9 @@ Authors: Scott Morrison
 import Lean.Replay
 import Lean.Elab.Command
 import REPL.Util.Pickle
+import REPL.PP.PrettyPrinter
+import REPL.PP.PPLctx
+import REPL.TheoremM.TheoremM
 
 open Lean Elab
 
@@ -109,6 +112,8 @@ structure ProofSnapshot where
   tacticState   : Tactic.State
   tacticContext : Tactic.Context
   rootGoals     : List MVarId
+  thmContext    : TheoremM.Context
+  thmState      : TheoremM.State
 
 namespace ProofSnapshot
 
@@ -157,6 +162,29 @@ and discarding the return value.
 def runTacticM' (p : ProofSnapshot) (t : TacticM α) : IO ProofSnapshot :=
   Prod.snd <$> p.runTacticM t
 
+/-- Run a `TheoremM` monadic function in the current `ProofSnapshot`, updating the `Theorem.State`. -/
+def runTheoremM [Inhabited α] (p : ProofSnapshot) (t : TheoremM α) (stx : Syntax) : IO (α × ProofSnapshot) := do
+  let ((a, thmState), p') ← p.runTacticM ((do
+      try
+        let a ← t
+        TheoremM.rename
+        TheoremM.deleteFailedTactics
+        return a
+      catch _ =>
+        TheoremM.addFailedTactic stx
+        return default
+      )
+    p.thmContext |>.run p.thmState)
+  return (a, { p' with thmState })
+
+def runTheoremM'' (p : ProofSnapshot) (t : TheoremM α) : IO (α × ProofSnapshot) := do
+  let ((a, thmState), p') ← p.runTacticM (t p.thmContext |>.run p.thmState)
+  return (a, { p' with thmState })
+
+/-- Run a `TheoremM` monadic function in the current `ProofSnapshot`, updating the `Theorem.State`. -/
+def runTheoremM' [Inhabited α] (p : ProofSnapshot) (t : TheoremM α) (stx : Syntax := default) : IO ProofSnapshot := do
+  Prod.snd <$> p.runTheoremM t stx
+
 /-- New traces in a `ProofSnapshot`, relative to an optional previous `ProofSnapshot`. -/
 def newTraces (new : ProofSnapshot) (old? : Option ProofSnapshot := none) : IO (List String) :=
   match old? with
@@ -171,20 +199,52 @@ def newTraces (new : ProofSnapshot) (old? : Option ProofSnapshot := none) : IO (
 Evaluate a `Syntax` into a `TacticM` tactic, and run it in the current `ProofSnapshot`.
 -/
 def runSyntax (p : ProofSnapshot) (t : Syntax) : IO ProofSnapshot :=
-  Prod.snd <$> p.runTacticM (evalTactic t)
+  p.runTheoremM' (evalTactic t) t
 
 /--
 Parse a string into a `Syntax`, evaluate it as a `TacticM` tactic,
 and run it in the current `ProofSnapshot`.
 -/
 def runString (p : ProofSnapshot) (t : String) : IO ProofSnapshot :=
-  match Parser.runParserCategory p.coreState.env `tactic t with
-  | .error e => throw (IO.userError e)
-  | .ok stx => p.runSyntax stx
+  -- dbg_trace ("run tactic: " ++ t)
+  match t with
+    | "add_variable" => p.runTheoremM' TheoremM.addVariable
+    | "add_function" => p.runTheoremM' TheoremM.addFunctionVariable
+    | "add_prop"     => p.runTheoremM' TheoremM.addPropVariable
+    | "close_goal"   => p.runTheoremM' TheoremM.closeGoal
+    | s =>
+      if s.startsWith "add_type " then
+        let rest := s.drop "add_type ".length
+        if not rest.isEmpty && rest.all Char.isDigit then
+          let n := rest.toNat!
+          p.runTheoremM' (TheoremM.addTypeVariable n)
+        else
+          throw <| IO.userError "invalid syntax for add_type"
+      else
+        -- normal tactic
+        match Parser.runParserCategory p.coreState.env `tactic s with
+        | .error e => throw (IO.userError e)
+        | .ok stx => p.runSyntax stx
 
 /-- Pretty print the current goals in the `ProofSnapshot`. -/
 def ppGoals (p : ProofSnapshot) : IO (List Format) :=
   Prod.fst <$> p.runMetaM do p.tacticState.goals.mapM (Meta.ppGoal ·)
+
+/-- Pretty print the current goals in the `ProofSnapshot`. -/
+def ppGoals'' (p : ProofSnapshot) : IO String := do
+  let goals ← Prod.fst <$> p.runMetaM do
+    -- uncommenting the next line prints detailed information of all meta variables when running the repl
+    -- dbg_trace ← CtxDebug.print_ctx
+    PrettyPrinter.ppGoals p.tacticState.goals
+  let thm ← Prod.fst <$> p.runTheoremM'' TheoremM.ppTheorem
+  let s := toString (thm ++ goals)
+  let s ← Prod.fst <$> p.runTheoremM'' (TheoremM.replaceLUserNames s)
+  return s
+
+/-- Pretty print the current goals in the `ProofSnapshot`. -/
+def ppGoals' (p : ProofSnapshot) : IO Format :=
+  Prod.fst <$> p.runMetaM do PrettyPrinter.ppGoals p.tacticState.goals
+
 /--
 Construct a `ProofSnapshot` from a `ContextInfo` and optional `LocalContext`, and a list of goals.
 
@@ -200,6 +260,11 @@ def create (ctx : ContextInfo) (lctx? : Option LocalContext) (env? : Option Envi
     let s := match env? with
     | none => s
     | some env => { s with env }
+    let tacticState : State := { goals }
+    let tacticContext : Context := { elaborator := .anonymous }
+    let ((thmContext, tacticState) , _) ← (TheoremM.createContext tacticContext |>.run tacticState) {} |>.run {}
+    let ((thmState,   tacticState) , _) ← (TheoremM.createState   tacticContext |>.run tacticState) {} |>.run {}
+
     pure <|
     { coreState := s
       coreContext := ← readThe Core.Context
@@ -207,11 +272,13 @@ def create (ctx : ContextInfo) (lctx? : Option LocalContext) (env? : Option Envi
       metaContext := ← readThe Meta.Context
       termState := {}
       termContext := {}
-      tacticState := { goals }
-      tacticContext := { elaborator := .anonymous }
+      tacticState := tacticState
+      tacticContext := tacticContext
       rootGoals := match rootGoals? with
         | none => goals
-        | some gs => gs }
+        | some gs => gs
+      thmState := thmState
+      thmContext := thmContext }
 
 open Lean.Core in
 /-- A copy of `Core.State` with the `Environment`, caches, and logging omitted. -/
@@ -303,7 +370,9 @@ def unpickle (path : FilePath) (cmd? : Option CommandSnapshot) :
     termContext := { termContext with }
     tacticState
     tacticContext
-    rootGoals }
+    rootGoals
+    thmState := {thm := tacticState.goals.head!}
+    thmContext := {} }
   let (_, p'') ← p'.runCoreM do
     for o in ← getOpenDecls do
       if let .simple ns _ := o then

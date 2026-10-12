@@ -11,6 +11,8 @@ import REPL.Lean.Environment
 import REPL.Lean.InfoTree
 import REPL.Lean.InfoTree.ToJson
 import REPL.Snapshots
+import REPL.input_tactics
+import REPL.PP.Delab
 
 /-!
 # A REPL for Lean.
@@ -160,16 +162,63 @@ private def collectFVars (e : Expr) : MetaM (Array Expr) := do
       fvars := fvars.push $ .fvar ldecl.fvarId
   return fvars
 
+/-- `true` iff the *codomain* of `ty` is `Prop` (so includes predicates like `α → Prop`). -/
+private partial def isPropish (ty : Expr) : MetaM Bool := do
+  let ty ← instantiateMVars ty
+  let ty ← Meta.whnf ty
+  match ty with
+  | .forallE _ _ body _ =>
+      isPropish body
+  | _ =>
+      Meta.isProp ty
 
-private def abstractAllLambdaFVars (e : Expr) : MetaM Expr := do
+/--
+Abstract all *irrelevant* Prop/predicate locals:
+locals whose type is Prop-ish but whose fvar does **not** occur in `e`.
+We also include forward dependencies using `collectForwardDeps` to keep the result well-scoped.
+
+This is important to enable hypotheses when generating theorems.
+
+example {x y : Nat} (h : x = 0) : y + x = y := sorry
+
+The type of the example does not depend on h. However, h is an essentiell part of the theorem.
+-/
+def abstractIrrelevantProps (e : Expr) : MetaM Expr := do
+  let used : NameSet := collectFVarsAux e
+
+  -- candidates: Prop-ish locals not used in `e`
+  let mut toAbs0 : Array Expr := #[]
+  for ldecl in ← getLCtx do
+    if ldecl.isImplementationDetail then
+      continue
+    if used.contains ldecl.fvarId.name then
+      continue
+    if (← isPropish ldecl.type) then
+      toAbs0 := toAbs0.push (.fvar ldecl.fvarId)
+
+  if toAbs0.isEmpty then
+    return e
+
+  -- include forward dependencies & preserve an order that is safe for binding
+  let toAbs ← Meta.collectForwardDeps toAbs0 (preserveOrder := true)
+
+  if toAbs.isEmpty then
+    return e
+  else
+    Meta.mkForallFVars toAbs e
+
+private def abstractAllForallFVars (e : Expr) : MetaM Expr := do
   let mut e' := e
+  e' ← abstractIrrelevantProps e
   while e'.hasFVar do
     let fvars ← collectFVars e'
     if fvars.isEmpty then
       break
-    e' ← Meta.mkLambdaFVars fvars e'
+    e' ← Meta.mkForallFVars fvars e'
   return e'
 
+-- original version: getProofStatus
+-- changes: if there are no goals, we check the generated theorem instead of the proof.
 /--
 Evaluates the current status of a proof, returning a string description.
 Main states include:
@@ -179,25 +228,25 @@ Main states include:
 
 Inspired by LeanDojo REPL's status tracking.
 -/
-def getProofStatus (proofState : ProofSnapshot) : M m String := do
+def getThmStatus (proofState : ProofSnapshot) : M m String := do
   match proofState.tacticState.goals with
     | [] =>
       let res := proofState.runMetaM do
-        match proofState.rootGoals with
-        | [goalId] =>
-          goalId.withContext do
-          match proofState.metaState.mctx.getExprAssignmentCore? goalId with
+        let thmId := proofState.thmState.thm
+        thmId.withContext do
+          match proofState.metaState.mctx.getExprAssignmentCore? thmId with
           | none => return "Error: Goal not assigned"
           | some pf => do
             let pf ← instantiateMVars pf
 
             -- First check that the proof has the expected type
             let pft ← Meta.inferType pf >>= instantiateMVars
-            let expectedType ← Meta.inferType (mkMVar goalId) >>= instantiateMVars
+            let expectedType ← Meta.inferType (mkMVar thmId) >>= instantiateMVars
             unless (← Meta.isDefEq pft expectedType) do
               return s!"Error: proof has type {pft} but root goal has type {expectedType}"
 
-            let pf ← abstractAllLambdaFVars pf
+            let pf ← abstractAllForallFVars pf
+            let pf ← instantiateMVars pf
             let pft ← Meta.inferType pf >>= instantiateMVars
 
             if pf.hasExprMVar then
@@ -215,6 +264,9 @@ def getProofStatus (proofState : ProofSnapshot) : M m String := do
               hints := ReducibilityHints.opaque,
               safety := DefinitionSafety.safe
             }
+            --dbg_trace f!"type: {pft}"
+            --dbg_trace f!"value: {pf}"
+            --dbg_trace f!"levelParams: {usedLevels.params.toList}"
 
             try
               let _ ← addDecl decl
@@ -225,17 +277,71 @@ def getProofStatus (proofState : ProofSnapshot) : M m String := do
               return "Incomplete: contains sorry"
             return "Completed"
 
-        | _ => return "Not verified: more than one initial goal"
       return (← res).fst
 
     | _ => return "Incomplete: open goals remain"
+
+
+partial def eraseMacroScopesExpr : Expr → Expr
+  | .bvar i => .bvar i
+  | .fvar fvarId => .fvar fvarId
+  | .mvar mvarId => .mvar mvarId
+  | .sort u => .sort u
+  | .const declName us => .const declName us
+  | .app fn arg => .app (eraseMacroScopesExpr fn) (eraseMacroScopesExpr arg)
+  | .lam binderName binderType body binderInfo =>
+      .lam binderName.eraseMacroScopes
+        (eraseMacroScopesExpr binderType)
+        (eraseMacroScopesExpr body)
+        binderInfo
+  | .forallE binderName binderType body binderInfo =>
+      .forallE binderName.eraseMacroScopes
+        (eraseMacroScopesExpr binderType)
+        (eraseMacroScopesExpr body)
+        binderInfo
+  | .letE declName type value body nondep =>
+      .letE declName.eraseMacroScopes
+        (eraseMacroScopesExpr type)
+        (eraseMacroScopesExpr value)
+        (eraseMacroScopesExpr body)
+        nondep
+  | .lit l => .lit l
+  | .mdata data expr => .mdata data (eraseMacroScopesExpr expr)
+  | .proj typeName idx struct => .proj typeName.eraseMacroScopes idx (eraseMacroScopesExpr struct)
+
+def getThm (proofState : ProofSnapshot) : M m String := do
+  let res := proofState.runMetaM do
+    let thmId := proofState.thmState.thm
+    thmId.withContext do
+      match proofState.metaState.mctx.getExprAssignmentCore? thmId with
+      | none => return "Error: Goal not assigned"
+      | some pf => do
+        let pf ← instantiateMVars pf
+
+        -- First check that the proof has the expected type
+        let pft ← Meta.inferType pf >>= instantiateMVars
+        let expectedType ← Meta.inferType (mkMVar thmId) >>= instantiateMVars
+        unless (← Meta.isDefEq pft expectedType) do
+          return s!"Error: proof has type {pft} but root goal has type {expectedType}"
+
+        let pf ← abstractAllForallFVars pf
+        let pf ← instantiateMVars pf
+
+        let _ : ToFormat Name := ⟨fun n => Lean.instToFormatName_lean.format n.eraseMacroScopes⟩
+
+        let s := Format.pretty (repr (eraseMacroScopesExpr pf)) 100000000
+
+        return s
+
+  return (← res).fst
+
 
 /-- Record a `ProofSnapshot` and generate a JSON response for it. -/
 def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnapshot := none) :
     M m ProofStepResponse := do
   let messages := proofState.newMessages old?
   let messages ← messages.mapM fun m => Message.of m
-  let traces ← proofState.newTraces old?
+  let mut traces ← proofState.newTraces old?
   let trees := proofState.newInfoTrees old?
   let trees ← match old? with
   | some old => do
@@ -247,13 +353,17 @@ def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnap
   -- trees.forM fun t => do IO.println (← t.format)
   let sorries ← sorries trees none (some proofState.rootGoals)
   let id ← recordProofSnapshot proofState
+  let proofStatus := ← getThmStatus proofState
+  if proofStatus == "Completed" then do
+    let s ← getThm proofState
+    traces := s :: traces
   return {
     proofState := id
-    goals := (← proofState.ppGoals).map fun s => s!"{s}"
+    goals := [← proofState.ppGoals'']
     messages
     sorries
     traces
-    proofStatus := (← getProofStatus proofState) }
+    proofStatus}
 
 /-- Pickle a `CommandSnapshot`, generating a JSON response. -/
 def pickleCommandSnapshot (n : PickleEnvironment) : M m (CommandResponse ⊕ Error) := do
@@ -418,6 +528,31 @@ def printFlush [ToString α] (s : α) : IO Unit := do
   out.putStr (toString s)
   out.flush -- Flush the output
 
+/--
+Debugging Tool.
+Similar to repl, but with a fixed set of commands.
+This way, I dont have to type each command in the repl for testing purposes.
+-/
+unsafe def repl_test : IO Unit :=
+  StateT.run' (loop tactics) {}
+where loop (inputs : List String) : M IO Unit := do
+  if inputs.isEmpty then
+    return ()
+  let query := inputs.headD ""
+  if query = "" then
+    return ()
+  if query.startsWith "#" || query.startsWith "--" then loop inputs.tail else
+  IO.println <| toString <| ← match ← parse query with
+  | .command r => return toJson (← runCommand r)
+  | .file r => return toJson (← processFile r)
+  | .proofStep r => return toJson (← runProofStep r)
+  | .pickleEnvironment r => return toJson (← pickleCommandSnapshot r)
+  | .unpickleEnvironment r => return toJson (← unpickleCommandSnapshot r)
+  | .pickleProofSnapshot r => return toJson (← pickleProofSnapshot r)
+  | .unpickleProofSnapshot r => return toJson (← unpickleProofSnapshot r)
+  printFlush "\n" -- easier to parse the output if there are blank lines
+  loop inputs.tail
+
 /-- Read-eval-print loop for Lean. -/
 unsafe def repl : IO Unit :=
   StateT.run' loop {}
@@ -436,8 +571,3 @@ where loop : M IO Unit := do
   | .unpickleProofSnapshot r => return toJson (← unpickleProofSnapshot r)
   printFlush "\n" -- easier to parse the output if there are blank lines
   loop
-
-/-- Main executable function, run as `lake exe repl`. -/
-unsafe def main (_ : List String) : IO Unit := do
-  initSearchPath (← Lean.findSysroot)
-  repl

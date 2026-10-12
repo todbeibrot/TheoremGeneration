@@ -6,8 +6,14 @@ name = "REPL"
 
 [[lean_exe]]
 name = "repl"
-root = "REPL.Main"
+root = "REPL.repl"
 supportInterpreter = true
+
+[[lean_exe]]
+name = "repl_test"
+root = "REPL.repl_test"
+supportInterpreter = true
+
 
 [[lean_exe]]
 name = "test"
