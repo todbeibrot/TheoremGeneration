@@ -1,0 +1,42 @@
+(- infer_instance)
+- get small set of definitions by sampling from theorems in a test set
+- collect definitions by sampling const expr in the type of theorems
+- make a list of possible tokens (everything inside Lean)
+    - make API to print all unexpected tokens in the vocabulary
+- LLM
+    - second repl
+    - load to gpu
+    - generate proof
+    - prompt
+    - check proof
+    - difficulty estimation? value network?
+
+- get the theorem
+    - if proofStatus is "Completed": add to the traces list containing the theorem as expr
+
+    - send expr to second repl
+    - read the expr (in Lean)
+    - add const using expr
+    - #print the const
+    - message to python
+    - run result (new const)
+    - compare const
+
+
+
+- embed the theorem into a file
+- RL
+    
+- make a proper structure for folders, ...
+    - save data
+    - load data
+    - what data should be saved in run/explicit?
+    - load last run data
+
+
+- logging
+    - which environment infos to log?
+        - add to last info of an episode
+        - add to custom metrics in logger
+
+- Intrinsic-curiosity-model (ICM) Based Curiosity?

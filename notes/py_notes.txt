@@ -1,0 +1,8 @@
+one repl with local repl
+one standard repl
+
+start without LLMs. replace LLM by   2|length (theorem)
+
+save/load all data (vocabulary, ...)
+
+
