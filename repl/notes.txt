@@ -1,0 +1,90 @@
+TODO
+(infer_instance)
+(warning as error in tactics. no new tactic state!)
+(pickle and unpickle)
+(add tokens to combine common bundles of tokens similar to how tokenizers for LLMs are made)
+
+renaming
+- LMVarIds replace in Lean
+- MVarIds  replace in Lean
+- FVarIds  replace in Lean
+(- rename names in Expr like declName in letE)
+
+Theorem Generation in Lean:
+- a monad on top of tactic monad
+- additional global variables across goals
+- observe always the generated theorem
+- write tactics for all actions
+- observe failed tactics
+- add to non-Prop observations if they are being used
+- rename variables at each step
+
+Observation:
+- Syntax tree
+- one text + depths
+- goals+hypotheses
+- one declaration, one token
+- during training, make a dict of all tokens
+- approx winrate of every agent. (reward = |success - winrate|)
+- global hypotheses (if we add a new variable, all goals should have access to it)
+- unexpanders for numbers, strings, chars, scientific numbers, ...
+- failed tactics
+- number of goals
+
+LeanInteract:
+- two versions for RL and Agents
+
+
+Reward:
+- reward = |success - winrate|
+- reward += small reward for generating something
+- reward diversity
+
+
+Diversity:
+- using different definitions
+- letting agent(s) decide
+- different proofs
+
+Action:
+- apply' <def>
+- new variable
+- new variable of type Type + element in this type
+- new variable of type Prop
+- new function variable
+- <close_goal> add goal as variable and apply it
+- if instance, check automatically apply_instance (no action)
+- apply_instance
+- rotate_left, rotate_right
+- numbers
+- apply <variable>
+- intro <new variable>
+- intros <new variables>
+- constructor
+- assumption
+
+Definitions:
+- filter to use only definitions which appear in the type of theorems in Mathlib
+- start with a minimal set? like MiniF2F
+
+After Theorem Generation:
+- build a trivial test solver
+- solve with AI agents
+- humanize variable names
+- write down theorems
+
+
+NN:
+- transformer
+- check for transformers without the need of an embedding
+- tree aware transformer
+- check Lean pp options
+- mask failed actions
+
+
+Past-Processing:
+(- check if there are tools to minimize instances given)
+- verification of theorems
+
+RL
+- simple PPO
